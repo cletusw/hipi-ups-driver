@@ -1,0 +1,33 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target = <&gpio>;
+        __overlay__ {
+            monitor_pins: monitor_pins {
+                brcm,pins = <17>;
+                brcm,function = <0>; /* Input */
+                brcm,pull = <2>;     /* 2 = Internal Pull-Up */
+            };
+        };
+    };
+
+    fragment@1 {
+        target-path = "/";
+        __overlay__ {
+            hipi_ups_gpio_monitor {
+                compatible = "custom,hipi-ups";
+                /* 17 = Pin, 1 = GPIO_ACTIVE_LOW */
+                monitor-gpios = <&gpio 17 1>;
+
+                pinctrl-names = "default";
+                pinctrl-0 = <&monitor_pins>;
+
+                status = "okay";
+            };
+        };
+    };
+};
