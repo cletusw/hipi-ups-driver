@@ -6,23 +6,36 @@
 #include <linux/slab.h>        /* For devm_kzalloc and memory management */
 #include <linux/workqueue.h>   /* Required for delayed_work */
 #include <linux/reboot.h>      /* Required for orderly_poweroff */
+#include <linux/timer.h>       /* Required for watchdog timer */
 
 MODULE_DESCRIPTION("Hipi UPS Driver");
 MODULE_AUTHOR("Clayton Watts <cletusw@gmail.com>");
 MODULE_LICENSE("Dual MIT/GPL");
 
-/* 60 seconds delay converted to milliseconds */
-#define SHUTDOWN_DELAY_MS 60000
+#define SHUTDOWN_DELAY_MS 60000 /* Wait 60s after power fault detected before starting poweroff in case power returns */
+#define UPS_ONLINE_WATCHDOG_TIMEOUT_MS 2000 /* UPS toggles every 500ms; wait 2s just to be safe */
 
 struct gpio_data {
     struct gpio_desc *power_desc;  /* For power fault detection (Input) */
     struct gpio_desc *status_desc; /* For sending Pi status to UPS (Output) */
+    struct gpio_desc *ups_online_desc; /* For detecting if UPS is online (Input)*/
     int power_irq;
+    int ups_online_irq;
     struct delayed_work shutdown_work;
+    struct timer_list ups_online_timer;
     struct device *dev; /* Reference for logging */
+    bool ups_online;
 };
 
-/* Timer expired. Shutdown now */
+/* ups_online_timer expired due to missing UPS heartbeat */
+static void ups_online_timer_callback(struct timer_list *t)
+{
+    struct gpio_data *data = from_timer(data, t, ups_online_timer);
+    data->ups_online = false;
+    dev_crit(data->dev, "UPS heartbeat missing! Check hardware connections.\n");
+}
+
+/* delayed_work shutdown_work triggered. Shutdown now */
 static void shutdown_work_handler(struct work_struct *work)
 {
     struct gpio_data *data = container_of(work, struct gpio_data, shutdown_work.work);
@@ -32,7 +45,21 @@ static void shutdown_work_handler(struct work_struct *work)
     orderly_poweroff(/* force= */ true);
 }
 
-/* The Interrupt Handler */
+static irqreturn_t ups_online_irq_handler(int irq, void *dev_id)
+{
+    struct gpio_data *data = dev_id;
+
+    if (!data->ups_online) {
+        data->ups_online = true;
+        dev_info(data->dev, "UPS heartbeat detected (Online).\n");
+    }
+
+    /* Reset the watchdog timer */
+    mod_timer(&data->ups_online_timer, jiffies + msecs_to_jiffies(UPS_ONLINE_WATCHDOG_TIMEOUT_MS));
+
+    return IRQ_HANDLED;
+}
+
 static irqreturn_t power_irq_handler(int irq, void *dev_id)
 {
     struct gpio_data *data = dev_id;
@@ -61,6 +88,7 @@ static int hipi_ups_probe(struct platform_device *pdev)
     if (!data) return -ENOMEM;
 
     data->dev = dev;
+    data->ups_online = false;
 
     /* --- Pi status/heartbeat output --- */
     /* Request the pin and immediately initialize it to Logical 0 (Low).
@@ -104,9 +132,30 @@ static int hipi_ups_probe(struct platform_device *pdev)
                                     IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
                                     "hipi_ups_power_irq", data);
     if (ret) {
-        dev_err(dev, "Failed to request IRQ\n");
+        dev_err(dev, "Failed to request power fault IRQ\n");
         return ret;
     }
+
+    /* --- UPS online detection --- */
+    timer_setup(&data->ups_online_timer, ups_online_timer_callback, 0);
+
+    data->ups_online_desc = devm_gpiod_get(dev, "online", GPIOD_IN);
+    if (IS_ERR(data->ups_online_desc)) {
+        dev_err(dev, "Failed to get online-gpios\n");
+        return PTR_ERR(data->ups_online_desc);
+    }
+
+    data->ups_online_irq = gpiod_to_irq(data->ups_online_desc);
+    ret = devm_request_threaded_irq(dev, data->ups_online_irq, NULL, ups_online_irq_handler,
+                                    IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+                                    "hipi_ups_online_irq", data);
+    if (ret) {
+        dev_err(dev, "Failed to request UPS online IRQ\n");
+        return ret;
+    }
+
+    /* Start the watchdog timer to wait for first toggle */
+    mod_timer(&data->ups_online_timer, jiffies + msecs_to_jiffies(UPS_ONLINE_WATCHDOG_TIMEOUT_MS));
 
     platform_set_drvdata(pdev, data);
     dev_info(dev, "Driver probed, monitoring IRQ %d\n", data->power_irq);
@@ -116,6 +165,9 @@ static int hipi_ups_probe(struct platform_device *pdev)
 static void hipi_ups_remove(struct platform_device *pdev)
 {
     struct gpio_data *data = platform_get_drvdata(pdev);
+
+    /* Delete the ups_online_timer */
+    del_timer_sync(&data->ups_online_timer);
 
     /* Ensure any pending shutdown works are cancelled if we unload the module */
     cancel_delayed_work_sync(&data->shutdown_work);
