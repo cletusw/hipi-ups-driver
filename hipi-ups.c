@@ -4,28 +4,53 @@
 #include <linux/interrupt.h>       /* For request_irq and irqreturn_t */
 #include <linux/of.h>          /* Core Device Tree support */
 #include <linux/slab.h>        /* For devm_kzalloc and memory management */
+#include <linux/workqueue.h>   /* Required for delayed_work */
+#include <linux/reboot.h>      /* Required for orderly_poweroff */
 
-MODULE_DESCRIPTION("Hipi UPS GPIO Interrupt Listener");
+MODULE_DESCRIPTION("Hipi UPS Driver");
 MODULE_AUTHOR("Clayton Watts <cletusw@gmail.com>");
 MODULE_LICENSE("Dual MIT/GPL");
 
+/* 60 seconds delay converted to milliseconds */
+#define SHUTDOWN_DELAY_MS 60000
+
 struct gpio_data {
-    struct gpio_desc *desc;
-    int irq;
+    struct gpio_desc *power_desc;
+    int power_irq;
+    struct delayed_work shutdown_work;
+    struct device *dev; /* Reference for logging */
 };
 
+/* Timer expired. Shutdown now */
+static void shutdown_work_handler(struct work_struct *work)
+{
+    struct gpio_data *data = container_of(work, struct gpio_data, shutdown_work.work);
+
+    dev_alert(data->dev, "Power failure persisted for %d ms. Initiating shutdown.\n", SHUTDOWN_DELAY_MS);
+
+    orderly_poweroff(/* force= */ true);
+}
+
 /* The Interrupt Handler */
-static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
+static irqreturn_t power_irq_handler(int irq, void *dev_id)
 {
     struct gpio_data *data = dev_id;
-    int val = gpiod_get_value(data->desc);
+    int val = gpiod_get_value(data->power_desc);
 
-    pr_info("hipi-ups: Interrupt! Pin is now %s\n", val ? "HIGH" : "LOW");
+    if (val == 1) {
+        /* High = Power Fault. Schedule shutdown. */
+        dev_warn(data->dev, "Power Lost! Shutdown scheduled in %d ms.\n", SHUTDOWN_DELAY_MS);
+        schedule_delayed_work(&data->shutdown_work, msecs_to_jiffies(SHUTDOWN_DELAY_MS));
+    } else {
+        /* Low = Power Restored. Cancel shutdown. */
+        dev_warn(data->dev, "Power Restored. Shutdown cancelled.\n");
+        cancel_delayed_work_sync(&data->shutdown_work);
+    }
 
     return IRQ_HANDLED;
 }
 
-static int hipi_ups_gpio_probe(struct platform_device *pdev)
+static int hipi_ups_probe(struct platform_device *pdev)
 {
     struct device *dev = &pdev->dev;
     struct gpio_data *data;
@@ -34,31 +59,51 @@ static int hipi_ups_gpio_probe(struct platform_device *pdev)
     data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
     if (!data) return -ENOMEM;
 
-    /* 1. Get the GPIO descriptor (marked as input) */
-    /* "monitor" corresponds to "monitor-gpios" in Device Tree */
-    data->desc = devm_gpiod_get(dev, "monitor", GPIOD_IN);
-    if (IS_ERR(data->desc)) {
-        dev_err(dev, "Failed to get GPIO\n");
-        return PTR_ERR(data->desc);
+    data->dev = dev;
+
+    /* Initialize the delayed work structure */
+    INIT_DELAYED_WORK(&data->shutdown_work, shutdown_work_handler);
+
+    /* Get the Power GPIO (corresponds to "power-gpios" in Device Tree) */
+    data->power_desc = devm_gpiod_get(dev, "power", GPIOD_IN);
+    if (IS_ERR(data->power_desc)) {
+        dev_err(dev, "Failed to get power-gpios\n");
+        return PTR_ERR(data->power_desc);
+    }
+    
+    /* Check initial state in case we booted without power */
+    if (gpiod_get_value(data->power_desc)) {
+        dev_warn(dev, "Booted with power failure detected.\n");
+        schedule_delayed_work(&data->shutdown_work, msecs_to_jiffies(SHUTDOWN_DELAY_MS));
     }
 
-    /* 2. Map the GPIO to an IRQ number */
-    data->irq = gpiod_to_irq(data->desc);
-    if (data->irq < 0) return data->irq;
+    /* Map the GPIO to an IRQ number */
+    data->power_irq = gpiod_to_irq(data->power_desc);
+    if (data->power_irq < 0) return data->power_irq;
 
-    /* 3. Request the interrupt */
+    /* Request the interrupt */
     /* IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING for both edges */
-    ret = devm_request_threaded_irq(dev, data->irq, NULL, gpio_irq_handler,
+    ret = devm_request_threaded_irq(dev, data->power_irq, NULL, power_irq_handler,
                                     IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
-                                    "hipi_ups_gpio_irq", data);
+                                    "hipi_ups_power_irq", data);
     if (ret) {
         dev_err(dev, "Failed to request IRQ\n");
         return ret;
     }
 
     platform_set_drvdata(pdev, data);
-    pr_info("hipi-ups: Driver probed, monitoring IRQ %d\n", data->irq);
+    dev_info(dev, "Driver probed, monitoring IRQ %d\n", data->power_irq);
     return 0;
+}
+
+static void hipi_ups_remove(struct platform_device *pdev)
+{
+    struct gpio_data *data = platform_get_drvdata(pdev);
+
+    /* Ensure any pending shutdown works are cancelled if we unload the module */
+    cancel_delayed_work_sync(&data->shutdown_work);
+
+    dev_info(&pdev->dev, "Module unloaded.\n");
 }
 
 static const struct of_device_id gpio_ids[] = {
@@ -68,7 +113,8 @@ static const struct of_device_id gpio_ids[] = {
 MODULE_DEVICE_TABLE(of, gpio_ids);
 
 static struct platform_driver hipi_ups_driver = {
-    .probe = hipi_ups_gpio_probe,
+    .probe = hipi_ups_probe,
+    .remove = hipi_ups_remove,
     .driver = {
         .name = "hipi_ups",
         .of_match_table = gpio_ids,
