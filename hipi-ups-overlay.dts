@@ -8,9 +8,9 @@
         target = <&gpio>;
         __overlay__ {
             monitor_pins: monitor_pins {
-                brcm,pins = <17>;
-                brcm,function = <0>; /* Input */
-                brcm,pull = <0>;     /* 0 = No pull (Floating) */
+                brcm,pins = <17 18>;    /* GPIO 17 and 18 */
+                brcm,function = <0 1>; /* 17 = Input, 18 = Output */
+                brcm,pull = <0 0>;     /* 0 = No pull (Floating) */
             };
         };
     };
@@ -21,6 +21,7 @@
             hipi_ups {
                 compatible = "custom,hipi-ups";
                 power-gpios = <&gpio 17 0>;  /* 17 = Pin, 0 = Active High */
+                status-gpios = <&gpio 18 0>; /* 18 = Pin, 0 = Active High */
 
                 pinctrl-names = "default";
                 pinctrl-0 = <&monitor_pins>;

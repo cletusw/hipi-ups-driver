@@ -15,7 +15,8 @@ MODULE_LICENSE("Dual MIT/GPL");
 #define SHUTDOWN_DELAY_MS 60000
 
 struct gpio_data {
-    struct gpio_desc *power_desc;
+    struct gpio_desc *power_desc;  /* For power fault detection (Input) */
+    struct gpio_desc *status_desc; /* For sending Pi status to UPS (Output) */
     int power_irq;
     struct delayed_work shutdown_work;
     struct device *dev; /* Reference for logging */
@@ -61,6 +62,22 @@ static int hipi_ups_probe(struct platform_device *pdev)
 
     data->dev = dev;
 
+    /* --- Pi status/heartbeat output --- */
+    /* Request the pin and immediately initialize it to Logical 0 (Low).
+     * GPIOD_OUT_LOW assumes Active High logic.
+     */
+    data->status_desc = devm_gpiod_get(dev, "status", GPIOD_OUT_LOW);
+    if (IS_ERR(data->status_desc)) {
+        dev_err(dev, "Failed to get status-gpios\n");
+        /* Optional: We might not want to fail probe if this pin is missing,
+           but for now we enforce it. */
+        return PTR_ERR(data->status_desc);
+    }
+
+    /* Explicitly set value to 0 to be extra clear */
+    gpiod_set_value(data->status_desc, 0);
+
+    /* --- Power fault detection --- */
     /* Initialize the delayed work structure */
     INIT_DELAYED_WORK(&data->shutdown_work, shutdown_work_handler);
 
@@ -70,7 +87,7 @@ static int hipi_ups_probe(struct platform_device *pdev)
         dev_err(dev, "Failed to get power-gpios\n");
         return PTR_ERR(data->power_desc);
     }
-    
+
     /* Check initial state in case we booted without power */
     if (gpiod_get_value(data->power_desc)) {
         dev_warn(dev, "Booted with power failure detected.\n");
@@ -102,6 +119,15 @@ static void hipi_ups_remove(struct platform_device *pdev)
 
     /* Ensure any pending shutdown works are cancelled if we unload the module */
     cancel_delayed_work_sync(&data->shutdown_work);
+
+    /* When module unloads, we could let devm_ handle releasing the status pin
+     * or release it manually. Choosing the former but also explicitly setting
+     * it High in the meantime to make sure the UPS receives the signal.
+     */
+    if (data->status_desc) {
+        dev_info(&pdev->dev, "Setting status pin to HIGH (Stopping).\n");
+        gpiod_set_value(data->status_desc, 1);
+    }
 
     dev_info(&pdev->dev, "Module unloaded.\n");
 }
